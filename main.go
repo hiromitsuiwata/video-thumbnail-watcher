@@ -4,7 +4,6 @@ import (
 	"crypto/md5"
 	"encoding/csv"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,7 +19,6 @@ import (
 )
 
 func main() {
-
 	path := parseArgument()
 
 	watcher, err := fsnotify.NewWatcher()
@@ -48,11 +46,11 @@ func watch(watcher fsnotify.Watcher) {
 				return
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
-				printGreen("create: " + event.Name)
+				fmt.Printf("create: %s\n", event.Name)
 				handleFile(event.Name)
 			}
 			if event.Op&fsnotify.Rename == fsnotify.Rename {
-				printGreen("rename: " + event.Name)
+				fmt.Printf("rename: %s\n", event.Name)
 				handleFile(event.Name)
 			}
 
@@ -65,27 +63,45 @@ func watch(watcher fsnotify.Watcher) {
 	}
 }
 
-func handleFile(file string) {
-	if (strings.HasSuffix(file, ".wmv") || strings.HasSuffix(file, ".mp4")) && !strings.Contains(file, "_bak") {
-		printGreen("handle: " + file)
-		mainProcess(file)
-	}
-}
-
-func mainProcess(filePath string) {
+func handleFile(input_filepath string) {
 	// ディレクトリ、ファイル名、拡張子に分解する
-	dir, filename, ext := splitFilePath(filePath)
+	dir, filename, ext := splitFilePath(input_filepath)
 
-	// ファイルの内容からmd5を作る
-	md5, err := renameToMD5(dir, filename, ext)
-	if err != nil {
-		fmt.Println("renameToMD5 error")
+	// 動画ファイル以外はスキップ
+	if !(ext == ".mp4" || ext == ".wmv") {
 		return
 	}
-	log.Printf("rename to md5: %s", md5)
+	// バックアップファイルはスキップ
+	if strings.Contains(filename, "_bak") {
+		return
+	}
+
+	fmt.Printf("\x1b[32mhandle: %s\x1b[0m\n", input_filepath)
+
+	// ファイルの内容からmd5を作る
+	md5, err := getMd5(dir, filename, ext)
+	if err != nil {
+		fmt.Printf("\x1b[31mmd5 error: %s\x1b[0m\n", filename+ext)
+		return
+	}
+
+	newFilePath := filepath.Join(dir, md5+ext)
+	if input_filepath == newFilePath {
+		// リネーム後のファイル名が同じになる場合はスキップ
+		fmt.Printf("\x1b[31msame file: %s\x1b[0m\n", filename+ext)
+		return
+	} else {
+		// リネームを実行
+		fmt.Printf("rename: %s -> %s", input_filepath, newFilePath)
+		err = os.Rename(input_filepath, newFilePath)
+		if err != nil {
+			fmt.Printf("\x1b[31mrename error\x1b[0m\n")
+			return
+		}
+	}
 
 	// probeファイルを作る
-	createFFPROBE(dir, md5, ext)
+	createFfprobe(dir, md5, ext)
 
 	// シーン情報を取得する
 	createSceneCSV(dir, md5, ext)
@@ -103,23 +119,25 @@ func mainProcess(filePath string) {
 	fmt.Println(md5)
 }
 
+// ファイルパスをディレクトリ、ファイルベース名、拡張子に分解する
+// 拡張子は先頭にピリオドを含む
 func splitFilePath(file string) (string, string, string) {
 	base := filepath.Base(file)
 	ext := filepath.Ext(file)
 	dir := filepath.Dir(file)
 	filename := strings.TrimSuffix(base, ext)
-	log.Printf("dir: %s, filename: %s, ext: %s", dir, filename, ext)
+	fmt.Printf("dir: %s, filename: %s, ext: %s\n", dir, filename, ext)
 	return dir, filename, ext
 }
 
-func renameToMD5(dir string, filename string, ext string) (string, error) {
-	fmt.Println("renameToMD5")
+func getMd5(dir string, filename string, ext string) (string, error) {
 	filePath := filepath.Join(dir, filename+ext)
 	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Println("md5生成エラー os.Open: ", err)
 		return "", err
 	}
+	defer file.Close()
 
 	hash := md5.New()
 
@@ -128,28 +146,13 @@ func renameToMD5(dir string, filename string, ext string) (string, error) {
 		return "", err
 	}
 
-	file.Close()
-
 	hashInBytes := hash.Sum(nil)[:16]
 	hashString := hex.EncodeToString(hashInBytes)
-
-	newFilePath := filepath.Join(dir, hashString+ext)
-	log.Println("old path: " + filePath)
-	log.Println("new path: " + newFilePath)
-
-	if filePath == newFilePath {
-		return hashString, errors.New("same file")
-	}
-
-	err = os.Rename(filePath, newFilePath)
-	if err != nil {
-		log.Fatal("rename error")
-	}
 
 	return hashString, nil
 }
 
-func createFFPROBE(dir string, filename string, ext string) {
+func createFfprobe(dir string, filename string, ext string) {
 	filePath := filepath.Join(dir, filename+ext)
 	out, _ := exec.Command("ffprobe", filePath).CombinedOutput()
 
@@ -240,25 +243,17 @@ func parseArgument() string {
 	flag.Parse()
 	fmt.Println("path:", path)
 	if len(path) == 0 {
-		printRed("argument path(-p) is required")
+		fmt.Printf("\x1b[31margument path(-p) is required\x1b[0m\n")
 		os.Exit(1)
 	}
 	fileInfo, err := os.Stat(path)
 	if os.IsNotExist(err) {
-		printRed(path + "is not exist")
+		fmt.Printf("\x1b[31m%s + is not exist\x1b[0m\n", path)
 		os.Exit(1)
 	}
 	if !fileInfo.IsDir() {
-		printRed(path + "is not a directory")
+		fmt.Printf("\x1b[31m%s is not a directory\x1b[0m\n", path)
 		os.Exit(1)
 	}
 	return path
-}
-
-func printRed(str string) {
-	fmt.Printf("\x1b[31m%s\x1b[0m\n", str)
-}
-
-func printGreen(str string) {
-	fmt.Printf("\x1b[32m%s\x1b[0m\n", str)
 }

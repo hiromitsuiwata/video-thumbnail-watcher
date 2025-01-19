@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -18,8 +17,12 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+const FFPROBE = "ffprobe"
+const MOV = "download"
+const GIF = "img"
+
 func main() {
-	path := parseArgument()
+	inputDir, outputDir := parseArguments()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -28,17 +31,17 @@ func main() {
 	defer watcher.Close()
 
 	done := make(chan bool)
-	go watch(*watcher)
+	go watch(*watcher, outputDir)
 
-	err = watcher.Add(path)
-	fmt.Println("watching...")
+	err = watcher.Add(inputDir)
+	log.Println("watching...")
 	if err != nil {
 		log.Fatal(err)
 	}
 	<-done
 }
 
-func watch(watcher fsnotify.Watcher) {
+func watch(watcher fsnotify.Watcher, outputDir string) {
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -46,12 +49,12 @@ func watch(watcher fsnotify.Watcher) {
 				return
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
-				fmt.Printf("create: %s\n", event.Name)
-				handleFile(event.Name)
+				log.Printf("create: %s\n", event.Name)
+				handleFile(event.Name, outputDir)
 			}
 			if event.Op&fsnotify.Rename == fsnotify.Rename {
-				fmt.Printf("rename: %s\n", event.Name)
-				handleFile(event.Name)
+				log.Printf("rename: %s\n", event.Name)
+				handleFile(event.Name, outputDir)
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -63,9 +66,9 @@ func watch(watcher fsnotify.Watcher) {
 	}
 }
 
-func handleFile(input_filepath string) {
+func handleFile(inputFile string, outputDir string) {
 	// ディレクトリ、ファイル名、拡張子に分解する
-	dir, filename, ext := splitFilePath(input_filepath)
+	dir, filename, ext := splitFilePath(inputFile)
 
 	// 動画ファイル以外はスキップ
 	if !(ext == ".mp4" || ext == ".wmv") {
@@ -76,26 +79,34 @@ func handleFile(input_filepath string) {
 		return
 	}
 
-	fmt.Printf("\x1b[32mhandle: %s\x1b[0m\n", input_filepath)
+	log.Printf("\x1b[32mhandle: %s\x1b[0m\n", inputFile)
 
 	// ファイルの内容からmd5を作る
 	md5, err := getMd5(dir, filename, ext)
 	if err != nil {
-		fmt.Printf("\x1b[31mmd5 error: %s\x1b[0m\n", filename+ext)
+		log.Printf("\x1b[31mmd5 error: %s\x1b[0m\n", filename+ext)
+		return
+	}
+
+	// md5をもとに出力先ディレクトリに同名ファイルが存在する場合はスキップ
+	outputProbe := filepath.Join(outputDir, FFPROBE, md5+".txt")
+	_, err = os.Stat(outputProbe)
+	if err == nil {
+		log.Printf("\x1b[31mfile exists: %s\x1b[0m\n", outputProbe)
 		return
 	}
 
 	newFilePath := filepath.Join(dir, md5+ext)
-	if input_filepath == newFilePath {
+	if inputFile == newFilePath {
 		// リネーム後のファイル名が同じになる場合はスキップ
-		fmt.Printf("\x1b[31msame file: %s\x1b[0m\n", filename+ext)
+		log.Printf("\x1b[31msame file: %s\x1b[0m\n", filename+ext)
 		return
 	} else {
 		// リネームを実行
-		fmt.Printf("rename: %s -> %s", input_filepath, newFilePath)
-		err = os.Rename(input_filepath, newFilePath)
+		log.Printf("rename: %s -> %s\n", inputFile, newFilePath)
+		err = os.Rename(inputFile, newFilePath)
 		if err != nil {
-			fmt.Printf("\x1b[31mrename error\x1b[0m\n")
+			log.Printf("\x1b[31mrename error\x1b[0m\n")
 			return
 		}
 	}
@@ -111,12 +122,47 @@ func handleFile(input_filepath string) {
 
 	// 静止画からサムネイルGIFを作る
 	createThumbnailGif(dir, md5, ext, scenes)
+	log.Printf("thumbnail created: %s/%s%s\n", dir, md5, ".gif")
 
 	// 中間ファイルを削除する
 	clean(dir, md5, ext)
+	log.Printf("clean temp files\n")
 
-	log.Printf("thumbnail created!: %s/%s%s\n", dir, md5, ".gif")
-	fmt.Println(md5)
+	// 出力先にファイルをコピーする
+	log.Printf("copy files start...\n")
+	copy(filepath.Join(dir, md5+".txt"), filepath.Join(outputDir, FFPROBE, md5+".txt"))
+	copy(filepath.Join(dir, md5+".gif"), filepath.Join(outputDir, GIF, md5+".gif"))
+	copy(filepath.Join(dir, md5+ext), filepath.Join(outputDir, MOV, md5+ext))
+	log.Printf("copy files end\n")
+
+	log.Println("md5: ", md5)
+}
+
+func copy(src string, dst string) {
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		log.Println("cannot crete dst. error:", err)
+		return
+	} else {
+		log.Printf("create dst: %s", dst)
+	}
+	defer dstFile.Close()
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		log.Println("cannot crete src. error:", err)
+	} else {
+		log.Printf("create src: %s", src)
+	}
+	defer srcFile.Close()
+
+	log.Printf("copy start: %s -> %s\n", src, dst)
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		log.Println("copy error: ", err)
+	} else {
+		log.Printf("copy end: %s -> %s\n", src, dst)
+	}
 }
 
 // ファイルパスをディレクトリ、ファイルベース名、拡張子に分解する
@@ -126,7 +172,7 @@ func splitFilePath(file string) (string, string, string) {
 	ext := filepath.Ext(file)
 	dir := filepath.Dir(file)
 	filename := strings.TrimSuffix(base, ext)
-	fmt.Printf("dir: %s, filename: %s, ext: %s\n", dir, filename, ext)
+	log.Printf("dir: %s, filename: %s, ext: %s\n", dir, filename, ext)
 	return dir, filename, ext
 }
 
@@ -134,7 +180,7 @@ func getMd5(dir string, filename string, ext string) (string, error) {
 	filePath := filepath.Join(dir, filename+ext)
 	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println("md5生成エラー os.Open: ", err)
+		log.Println("md5生成エラー os.Open: ", err)
 		return "", err
 	}
 	defer file.Close()
@@ -142,7 +188,7 @@ func getMd5(dir string, filename string, ext string) (string, error) {
 	hash := md5.New()
 
 	if _, err := io.Copy(hash, file); err != nil {
-		fmt.Println("md5生成エラー io.Copy", err)
+		log.Println("md5生成エラー io.Copy", err)
 		return "", err
 	}
 
@@ -157,7 +203,7 @@ func createFfprobe(dir string, filename string, ext string) {
 	out, _ := exec.Command("ffprobe", filePath).CombinedOutput()
 
 	probeFilePath := filepath.Join(dir, filename+".txt")
-	err := ioutil.WriteFile(probeFilePath, out, 0644)
+	err := os.WriteFile(probeFilePath, out, 0644)
 	if err != nil {
 		log.Println(err)
 		log.Fatal("probe error")
@@ -166,7 +212,7 @@ func createFfprobe(dir string, filename string, ext string) {
 
 func createSceneCSV(dir string, filename string, ext string) {
 	filePath := filepath.Join(dir, filename+ext)
-	log.Println("createSceneCSV: " + filePath)
+	log.Printf("createSceneCSV: %s\n", filePath)
 	_, err := exec.Command("scenedetect", "--input", filePath, "-o", dir, "detect-content", "list-scenes").CombinedOutput()
 	if err != nil {
 		log.Println(err)
@@ -176,7 +222,7 @@ func createSceneCSV(dir string, filename string, ext string) {
 
 func readCSV(dir string, filename string, ext string) []float32 {
 	filePath := filepath.Join(dir, filename+ext)
-	log.Println(filePath)
+	log.Printf("readCSV filePath: %s\n", filePath)
 	reader, _ := os.Open(filePath)
 	defer reader.Close()
 	csvReader := csv.NewReader(reader)
@@ -207,21 +253,17 @@ func createThumbnailGif(dir string, filename string, ext string, scenes []float3
 		s := fmt.Sprintf("%08.3f", v)
 		log.Printf("#%3d: %s\n", i, s)
 		imageFilePath := filepath.Join(dir, filename+"_"+s+".jpg")
-		_, err := exec.Command("ffmpeg", "-y", "-ss", s, "-i", filePath, "-vframes", "1", "-vf", "scale=320:-1", "-f", "image2", imageFilePath).CombinedOutput()
-		if err != nil {
-			log.Println(err)
-			log.Fatal("ffmpeg error")
-		}
+		cmd := exec.Command("ffmpeg", "-y", "-ss", s, "-i", filePath, "-vframes", "1", "-vf", "scale=320:-1", "-f", "image2", imageFilePath)
+		cmd.Start()
+		cmd.Wait()
 	}
 
 	imageFiles := filepath.Join(dir, filename+"*.jpg")
 
 	gifFile := filepath.Join(dir, filename+".gif")
-	_, err := exec.Command("C:\\Program Files\\ImageMagick-7.1.0-portable-Q16-x64\\convert.exe", "-delay", "70", imageFiles, gifFile).CombinedOutput()
-	if err != nil {
-		log.Println(err)
-		log.Fatal("covert error")
-	}
+	cmd := exec.Command("C:\\Program Files\\ImageMagick-7.1.0-portable-Q16-x64\\convert.exe", "-delay", "70", imageFiles, gifFile)
+	cmd.Start()
+	cmd.Wait()
 }
 
 func clean(dir string, filename string, ext string) {
@@ -237,23 +279,37 @@ func clean(dir string, filename string, ext string) {
 	})
 }
 
-func parseArgument() string {
-	var path string
-	flag.StringVar(&path, "p", "", "a directory to watch")
+func parseArguments() (string, string) {
+	// 入力ディレクトリ
+	var inputDir string
+	flag.StringVar(&inputDir, "i", "", "input directory")
+
+	// 移動先ディレクトリ
+	var outputDir string
+	flag.StringVar(&outputDir, "o", ".", "output directory")
+
+	// 引数をパース
 	flag.Parse()
-	fmt.Println("path:", path)
-	if len(path) == 0 {
-		fmt.Printf("\x1b[31margument path(-p) is required\x1b[0m\n")
+
+	// 入力ディレクトリが指定されていない場合は異常終了
+	if len(inputDir) == 0 {
+		log.Printf("\x1b[31m input directory(-i) is required \x1b[0m\n")
 		os.Exit(1)
 	}
-	fileInfo, err := os.Stat(path)
+
+	log.Println("input directory: ", inputDir)
+	log.Println("output directory: ", outputDir)
+
+	// 入力ディレクトリが存在しないかディレクトリでない場合は異常終了
+	fileInfo, err := os.Stat(inputDir)
 	if os.IsNotExist(err) {
-		fmt.Printf("\x1b[31m%s + is not exist\x1b[0m\n", path)
+		log.Printf("\x1b[31m %s + is not exist \x1b[0m\n", inputDir)
 		os.Exit(1)
 	}
 	if !fileInfo.IsDir() {
-		fmt.Printf("\x1b[31m%s is not a directory\x1b[0m\n", path)
+		log.Printf("\x1b[31m%s is not a directory\x1b[0m\n", inputDir)
 		os.Exit(1)
 	}
-	return path
+
+	return inputDir, outputDir
 }
